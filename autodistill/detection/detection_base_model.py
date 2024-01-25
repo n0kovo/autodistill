@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 import roboflow
 import supervision as sv
+from PIL import ImageFile
 from supervision.utils.file import save_text_file
 from tqdm import tqdm
 
@@ -49,11 +50,122 @@ class DetectionBaseModel(BaseModel):
             confidence_list = [str(x) for x in detections.confidence.tolist()]
             save_text_file(lines=confidence_list, file_path=confidence_path)
             print("Saved confidence file: " + confidence_path)
+            
+    def _process_directory(
+        self,
+        directory,
+        output_folder,
+        load_truncated_images,
+        sahi,
+        with_nms,
+        record_confidence,
+        human_in_the_loop,
+        roboflow_project
+        ):
+        
+        images_map = {}
+        detections_map = {}
+
+        files = glob.glob(os.path.join(directory, '*'))
+        progress_bar = tqdm(files, desc=f"Processing directory: {directory}")
+
+        for f_path in progress_bar:
+            progress_bar.set_description(desc=f"Labeling {f_path}", refresh=True)
+
+            try:
+                image = cv2.imread(f_path)
+                if image is None and load_truncated_images:
+                    continue
+            except Exception as e:
+                raise
+
+            f_path_short = os.path.basename(f_path)
+            images_map[f_path_short] = image.copy()
+
+            try:
+                if sahi:
+                    detections = slicer(f_path)
+                else:
+                    detections = self.predict(f_path)
+
+                if with_nms:
+                    detections = detections.with_nms()
+            except OSError as e:
+                progress_bar.write(f"Could not process image '{f_path}': {e}")
+                continue
+
+        # Write metadata after processing each directory
+        if detections_map:
+            dataset = sv.DetectionDataset(self.ontology.classes(), images_map, detections_map)
+            dataset.as_yolo(output_folder + "/images", output_folder + "/annotations", 
+                            min_image_area_percentage=0.01, data_yaml_path=output_folder + "/data.yaml")
+            if record_confidence:
+                self._record_confidence_in_files(output_folder + "/annotations", images_map, detections_map)
+            
+            if human_in_the_loop:
+                roboflow.login()
+                rf = roboflow.Roboflow()
+                workspace = rf.workspace()
+                workspace.upload_dataset(output_folder, project_name=roboflow_project)
+                
+            split_data(output_folder, record_confidence=record_confidence)
+        else:
+            raise RuntimeError(f"No images could be processed in directory {directory}")
+
+        return images_map, detections_map
+    
+    
+    def _process_images(
+        self,
+        input_folder,
+        extensions,
+        recursive,
+        output_folder,
+        load_truncated_images,
+        sahi,
+        with_nms,
+        record_confidence,
+        human_in_the_loop,
+        roboflow_project
+        ):
+        
+        os.makedirs(output_folder, exist_ok=True)
+
+        # Initialize combined maps
+        combined_images_map = {}
+        combined_detections_map = {}
+
+        # Find directories
+        directories = {os.path.dirname(file) for ext in extensions for file in glob.glob(f"{input_folder}/**/*{ext}", recursive=recursive)}
+
+        for directory in directories:
+            images_map, detections_map = self._process_directory(directory, output_folder, load_truncated_images, sahi, with_nms, record_confidence, human_in_the_loop, roboflow_project)
+            combined_images_map.update(images_map)
+            combined_detections_map.update(detections_map)
+
+        # Create the combined dataset
+        dataset = sv.DetectionDataset(self.ontology.classes(), combined_images_map, combined_detections_map)
+        
+        if not combined_detections_map:
+            raise RuntimeError("No images could be processed")
+
+        # Perform the final dataset operations
+        dataset.as_yolo(output_folder + "/images", output_folder + "/annotations", 
+                        min_image_area_percentage=0.01, data_yaml_path=output_folder + "/data.yaml")
+        if record_confidence:
+            self._record_confidence_in_files(output_folder + "/annotations", combined_images_map, combined_detections_map)
+        split_data(output_folder, record_confidence=record_confidence)
+
+        return dataset
+
 
     def label(
         self,
         input_folder: str,
         extension: str = ".jpg",
+        extensions: list = None,
+        recursive: bool = False,
+        load_truncated_images: bool = False,
         output_folder: str = None,
         human_in_the_loop: bool = False,
         roboflow_project: str = None,
@@ -65,62 +177,26 @@ class DetectionBaseModel(BaseModel):
         """
         Label a dataset with the model.
         """
-        if output_folder is None:
-            output_folder = input_folder + "_labeled"
+        
+      # Use 'extensions' if set. Fall back to 'extension'
+        if extensions is not None:
+            if extension != ".jpg":
+                raise ValueError("`extension` and `extensions` are mutually exclusive.")
+        else:
+            extensions = [extension]
 
-        os.makedirs(output_folder, exist_ok=True)
-
-        images_map = {}
-        detections_map = {}
-
-        if sahi:
-            slicer = sv.InferenceSlicer(callback=self.predict)
-
-        files = glob.glob(input_folder + "/*" + extension)
-        progress_bar = tqdm(files, desc="Labeling images")
-        # iterate through images in input_folder
-        for f_path in progress_bar:
-            progress_bar.set_description(desc=f"Labeling {f_path}", refresh=True)
-            image = cv2.imread(f_path)
-
-            f_path_short = os.path.basename(f_path)
-            images_map[f_path_short] = image.copy()
-
-            if sahi:
-                detections = slicer(f_path)
-            else:
-                detections = self.predict(f_path)
-
-            if with_nms:
-                detections = detections.with_nms()
-
-            detections_map[f_path_short] = detections
-
-        dataset = sv.DetectionDataset(
-            self.ontology.classes(), images_map, detections_map
-        )
-
-        dataset.as_yolo(
-            output_folder + "/images",
-            output_folder + "/annotations",
-            min_image_area_percentage=0.01,
-            data_yaml_path=output_folder + "/data.yaml",
-        )
-
-        if record_confidence is True:
-            self._record_confidence_in_files(
-                output_folder + "/annotations", images_map, detections_map
+        dataset = self._process_images(
+            input_folder=input_folder,
+            extensions=extensions,
+            recursive=recursive,
+            output_folder=output_folder,
+            load_truncated_images=load_truncated_images,
+            sahi=sahi,
+            with_nms=with_nms,
+            record_confidence=record_confidence,
+            human_in_the_loop=human_in_the_loop,
+            roboflow_project=roboflow_project
             )
-        split_data(output_folder, record_confidence=record_confidence)
-
-        if human_in_the_loop:
-            roboflow.login()
-
-            rf = roboflow.Roboflow()
-
-            workspace = rf.workspace()
-
-            workspace.upload_dataset(output_folder, project_name=roboflow_project)
-
+        
         print("Labeled dataset created - ready for distillation.")
         return dataset
